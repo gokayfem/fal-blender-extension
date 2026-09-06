@@ -8,6 +8,7 @@ if _os.path.isdir(_vendor_dir) and _vendor_dir not in _sys.path:
 import bpy
 
 from . import branding as _branding
+from . import live_preview as _live_preview
 from .app import (
     FAL_PT_3D_JobsPanel,
     FAL_PT_3D_MainPanel,
@@ -44,12 +45,14 @@ def register() -> None:
     )
     bpy.utils.register_class(FAL_PT_3D_JobsPanel)
     bpy.utils.register_class(FAL_PT_VSE_JobsPanel)
+    _live_preview.register()
 
 
 def unregister() -> None:
     """
     Unregister the fal.ai addon.
     """
+    _live_preview.unregister()
     _advanced_params.unregister()
     bpy.utils.unregister_class(FAL_OT_OpenOutputFolder)
     bpy.utils.unregister_class(FalPreferences)

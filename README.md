@@ -2,6 +2,13 @@
 
 AI-powered 3D, materials, rendering, video, and audio — directly inside Blender.
 
+## Experimental H3 live viewport
+
+This fork adds an **H3 Live** sidebar: capture the viewport, generate a five-second
+H3 Max Turbo clip at 480p or 768p, and loop it beside the scene. Optional automatic
+refresh waits for scene/view changes to settle and stops at a configurable clip
+limit. See [setup, timing, and limitations](H3_LIVE_PREVIEW.md).
+
 ## Quick Start
 
 1. Install the addon (see [Installation](#installation)) - supports Blender 4.2 and up on all platforms
