@@ -37,8 +37,9 @@ Set the timeline to the first desired frame, set the session clip limit, and cli
 **Stream camera animation**. At least five seconds must remain in the frame range.
 
 For each five-second segment, the extension captures the camera's initial and final
-frames, sends both PNGs as base64 data URIs (`image_url` and `end_image_url`), and
-reuses the identical boundary PNG for the next segment. Captures restore the current
+frames, sends both captures as base64 data URIs (`image_url` and `end_image_url`), and
+reuses the identical boundary image for the next segment. PNG is the default;
+the Small JPEG capture option also applies here. Captures restore the current
 frame afterward. The API uses balanced prompt expansion and the safety checker.
 
 Two requests can run concurrently. Responses are played in segment order, regardless
@@ -67,6 +68,60 @@ telemetry panel, and runs the paired-frame demonstration. Use a separate process
 an existing scene is not replaced. The API key is read into process memory only.
 `stream-status.json` records segment metadata and underruns without credentials.
 
+## Gray geometry live build
+
+The auto-refresh panel now offers **H3 Max / interpret gray geometry** using
+reference-to-video with one current viewport reference, and **Small JPEG** using
+512×290 quality-80 captures. Keep Solid shading set to Single color for a gray
+source. The generated clip loops beside the editable geometry. New edits settle
+before capture; obsolete in-flight results are discarded. Geometry content is
+compared rather than dependency-graph invalidations, which capture can trigger.
+Evaluating and hashing geometry on each tick can be expensive in large scenes.
+
+Run `scripts/gray_live_build.py` in a fresh GUI Blender process:
+
+```text
+blender --factory-startup --online-mode --python scripts/gray_live_build.py -- --env /path/to/.env --output /path/to/output
+```
+
+Wait for `ready.flag`, begin recording the Blender window, then create
+`start-build.flag` in the output directory. Seven scripted geometry stages build
+a ship; every stage waits for a newly generated result and displays it for five
+seconds. No output clips are supplied in advance. The script saves the scene,
+final screenshot, and `build-status.json` with per-stage timing. Record the whole
+window continuously to preserve visible latency. The timer drives real Blender
+object edits; this is a scripted build, not a manual modeling performance.
+
+Reference conditioning is approximate. This mode is an asynchronous generative
+preview: it may reinterpret geometry or drift between clips, and it has several
+seconds of edit-to-visible latency. It is not a geometry-exact raster renderer.
+
+## Four simultaneous styles
+
+Add `--grid` to the gray-build command to arrange the gray source beside a 2×2
+grid. The four treatments are expedition realism, North Sea storm, cinematic
+science fiction, and a physical miniature. Style prompts specify surface palette,
+roughness, lighting, and water. They deliberately avoid cues such as finished ships,
+extra fittings, panel lines, or unmodeled windows. Shared geometry rules cap detail
+at the reference's current completeness. Simple geometry stays simple; each modeled
+addition supplies the next level of detail.
+
+Each settled edit captures one JPEG and starts four independent requests together.
+Each pane plays as its response arrives; the scripted build advances after all
+four are visible. Results map by style index, not completion order. Editing during
+a batch invalidates its remaining results. A failed request stops new batches;
+there is no automatic retry. Single-preview and camera-stream sessions cannot run
+at the same time as the grid.
+
+In a fresh workspace, use **Open four-style layout**, then **Start four-style grid**
+in the H3 Live panel. The session limit counts batches: 10 means up to 40 paid
+requests. The scripted seven-stage demo generates 28 clips. **Stop four-style grid**
+stops new requests while already submitted requests may finish. The four fixed
+treatment prompts live in `live_grid.py`; the panel prompt supplies shared geometry
+and scene direction. Approximate reference conditioning still allows drift.
+Add `--keep-live` to leave auto-refresh active after the scripted build. Subsequent
+edits continue using the current reference, up to the remaining session limit.
+
 ## Automated verification
 
 Run `blender --background --factory-startup --python-exit-code 1 --python tests/test_h3_live.py`.
@@ -75,6 +130,8 @@ download/timing persistence, and timeout behavior without retries or credential
 disclosure. These tests do not make paid requests.
 They also verify paired base64 inputs, shared boundary reuse, timeline restoration
 on failure, ordered playback after out-of-order completion, and single-clip prefill.
+Additional checks cover JPEG reference payloads, content-based geometry changes,
+and discarding a result when geometry changed while its request was in flight.
 
 Manual checks: capture a viewport, verify looping playback, rotate the view with
 Auto refresh enabled, verify that idle does not submit additional requests, stop

@@ -147,6 +147,10 @@ class FAL_OT_H3StreamStart(bpy.types.Operator):
 
     def execute(self, context):
         global _stream
+        from . import live_grid
+        if live_grid._session or any(w.is_alive() for w in live_grid._workers):
+            self.report({'WARNING'}, 'Stop the grid and wait for its requests to finish')
+            return {'CANCELLED'}
         if _stream or live_preview._session or any(w.is_alive() for w in _workers) or (live_preview._worker and live_preview._worker.is_alive()):
             self.report({"WARNING"}, "Stop the existing preview and wait for its requests to finish")
             return {"CANCELLED"}

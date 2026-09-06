@@ -1,6 +1,8 @@
 """H3 viewport experiments: main-thread capture/playback, isolated HTTP worker."""
 
 import base64
+import hashlib
+from array import array
 import json
 import queue
 import threading
@@ -18,28 +20,38 @@ from .preferences import get_api_key, get_output_dir
 ENDPOINT = "https://fal.run/minimax/h3-max-turbo/image-to-video"
 _session = None
 _preview = None
-_geometry_revision = 0
 _worker = None
 
 
-def build_payload(image_bytes, prompt, resolution, end_image_bytes=None):
+def _image_uri(image_bytes):
+    mime = "image/jpeg" if image_bytes.startswith(b"\xff\xd8") else "image/png"
+    return "data:" + mime + ";base64," + base64.b64encode(image_bytes).decode()
+
+
+def build_payload(image_bytes, prompt, resolution, end_image_bytes=None, reference_mode=False):
     if not prompt.strip():
         raise ValueError("Enter a motion prompt")
     if resolution not in {"480P", "768P"}:
         raise ValueError("Unsupported resolution")
     payload = dict(prompt=prompt.strip(), duration=5, resolution=resolution,
-                image_url="data:image/png;base64," + base64.b64encode(image_bytes).decode(),
                 prompt_expansion_mode="balanced", enable_safety_checker=True, sync_mode=False)
+    if reference_mode:
+        payload["reference_image_urls"] = [_image_uri(image_bytes)]
+        payload["aspect_ratio"] = "16:9"
+    else:
+        payload["image_url"] = _image_uri(image_bytes)
     if end_image_bytes is not None:
-        payload["end_image_url"] = "data:image/png;base64," + base64.b64encode(end_image_bytes).decode()
+        if reference_mode:
+            raise ValueError("Reference mode has no last-frame field")
+        payload["end_image_url"] = _image_uri(end_image_bytes)
     return payload
 
 
-def generate(key, payload, folder, events, token, capture_seconds):
+def generate(key, payload, folder, events, token, capture_seconds, endpoint=ENDPOINT):
     """No bpy access here. One POST, no automatic retries after uncertain completion."""
     started = time.perf_counter()
     try:
-        request = urllib.request.Request(ENDPOINT, data=json.dumps(payload).encode(),
+        request = urllib.request.Request(endpoint, data=json.dumps(payload).encode(),
                     headers={"Authorization": "Key " + key, "Content-Type": "application/json"})
         with urllib.request.urlopen(request, timeout=120) as response:
             result = json.load(response)
@@ -53,10 +65,10 @@ def generate(key, payload, folder, events, token, capture_seconds):
         with urllib.request.urlopen(url, timeout=60) as response:
             path.write_bytes(response.read())
         total = time.perf_counter() - started
-        metadata = dict(model=ENDPOINT.removeprefix("https://fal.run/"),
+        metadata = dict(model=endpoint.removeprefix("https://fal.run/"),
                         request_id=request_id, resolution=payload["resolution"], duration=5,
                         prompt=payload["prompt"], provider_timings=result.get("timings"),
-                        conditioning="first_last" if "end_image_url" in payload else "first",
+                        conditioning="reference" if "reference_image_urls" in payload else ("first_last" if "end_image_url" in payload else "first"),
                         capture_seconds=capture_seconds, api_seconds=api_seconds,
                         download_seconds=total-api_seconds, total_seconds=total+capture_seconds,
                         video_path=str(path))
@@ -70,6 +82,8 @@ def generate(key, payload, folder, events, token, capture_seconds):
 
 
 class H3LiveProperties(bpy.types.PropertyGroup):
+    preview_mode: bpy.props.EnumProperty(name="Preview model", items=[("I2V", "Turbo / anchored first frame", ""), ("REFERENCE", "H3 Max / interpret gray geometry", "")], default="I2V")
+    source_format: bpy.props.EnumProperty(name="Capture", items=[("PNG", "PNG / 848px", ""), ("JPEG", "Small JPEG / 512px", "")], default="PNG")
     prompt: bpy.props.StringProperty(name="Motion prompt", default="Slow cinematic camera move around the object. Preserve its shape, colors and composition. Subtle atmospheric motion.")
     resolution: bpy.props.EnumProperty(name="Resolution", items=[("480P", "480p / fast", ""), ("768P", "768p", "")], default="480P")
     max_requests: bpy.props.IntProperty(name="Session clip limit", default=10, min=1, max=100)
@@ -78,6 +92,35 @@ class H3LiveProperties(bpy.types.PropertyGroup):
     stream_status: bpy.props.StringProperty(default="Ready for camera animation", options={"SKIP_SAVE"})
     timing: bpy.props.StringProperty(default="", options={"SKIP_SAVE"})
     last_video: bpy.props.StringProperty(subtype="FILE_PATH", options={"SKIP_SAVE"})
+
+
+def _geometry_digest(scene):
+    """Hash evaluated surfaces, not dependency-graph invalidation notifications.
+
+    Capturing changes render settings and invalidates geometry without editing it.
+    Content comparison also detects vertex edits that leave object transforms intact.
+    This prototype favors correctness over performance on very large scenes.
+    """
+    digest = hashlib.blake2b(digest_size=16)
+    depsgraph = bpy.context.evaluated_depsgraph_get()
+    for obj in scene.objects:
+        if obj.type not in {'MESH', 'CURVE', 'SURFACE', 'FONT', 'META'}:
+            continue
+        if obj.mode == 'EDIT':
+            obj.update_from_editmode()
+        evaluated = obj.evaluated_get(depsgraph)
+        mesh = evaluated.to_mesh()
+        try:
+            coords = array('f', [0]) * (len(mesh.vertices) * 3)
+            indices = array('i', [0]) * len(mesh.loops)
+            mesh.vertices.foreach_get('co', coords)
+            mesh.loops.foreach_get('vertex_index', indices)
+            digest.update(obj.name.encode())
+            digest.update(coords.tobytes())
+            digest.update(indices.tobytes())
+        finally:
+            evaluated.to_mesh_clear()
+    return digest.digest()
 
 
 def _signature(session):
@@ -90,7 +133,7 @@ def _signature(session):
         values += [obj.name, obj.hide_viewport, obj.hide_render]
         values += [round(v, 4) for row in obj.matrix_world for v in row]
     props = scene.fal_h3_live
-    return tuple(values) + (scene.frame_current, props.prompt, props.resolution, _geometry_revision)
+    return tuple(values) + (scene.frame_current, props.prompt, props.resolution, props.preview_mode, props.source_format, _geometry_digest(scene))
 
 
 def _capture(session, camera_view=False):
@@ -99,16 +142,20 @@ def _capture(session, camera_view=False):
     names = ("resolution_x", "resolution_y", "resolution_percentage", "filepath", "film_transparent", "use_sequencer", "use_compositing")
     saved = {name: getattr(render, name) for name in names}
     image_format = render.image_settings.file_format
+    quality = render.image_settings.quality
     overlays = area.spaces.active.overlay.show_overlays
     region = next(r for r in area.regions if r.type == "WINDOW")
-    path = Path(session["folder"]) / ("h3-input-" + uuid.uuid4().hex[:12] + ".png")
+    jpeg = scene.fal_h3_live.source_format == "JPEG"
+    path = Path(session["folder"]) / ("h3-input-" + uuid.uuid4().hex[:12] + (".jpg" if jpeg else ".png"))
     try:
-        render.resolution_x, render.resolution_y, render.resolution_percentage = 848, 480, 100
+        render.resolution_x, render.resolution_y, render.resolution_percentage = (512, 290, 100) if jpeg else (848, 480, 100)
         render.filepath = str(path)
         render.film_transparent = False
         render.use_sequencer = False
         render.use_compositing = False
-        render.image_settings.file_format = "PNG"
+        render.image_settings.file_format = "JPEG" if jpeg else "PNG"
+        render.image_settings.quality = 80
+        bpy.app.driver_namespace["fal_capture_active"] = True
         area.spaces.active.overlay.show_overlays = False
         with bpy.context.temp_override(window=window, area=area, region=region):
             bpy.ops.render.opengl(write_still=True, view_context=not camera_view)
@@ -117,6 +164,8 @@ def _capture(session, camera_view=False):
         for name, value in saved.items():
             setattr(render, name, value)
         render.image_settings.file_format = image_format
+        render.image_settings.quality = quality
+        bpy.app.driver_namespace["fal_capture_active"] = False
         area.spaces.active.overlay.show_overlays = overlays
 
 
@@ -170,6 +219,11 @@ def _tick():
                     break
                 else:
                     s["busy"] = False
+                    if _signature(s) != s["submitted"]:
+                        props.status = "Geometry changed — discarding obsolete result"
+                        if s["count"] >= props.max_requests:
+                            _session = None
+                        continue
                     props.last_video = data["video_path"]
                     inference = (data["provider_timings"] or {}).get("inference")
                     gpu = f"{inference:.3f}s" if isinstance(inference, (int, float)) else "n/a"
@@ -188,11 +242,13 @@ def _tick():
                     props.status = "Capturing viewport"
                     start = time.perf_counter()
                     image = _capture(s)
-                    payload = build_payload(image, props.prompt, props.resolution)
+                    reference = props.preview_mode == "REFERENCE"
+                    payload = build_payload(image, props.prompt, props.resolution, reference_mode=reference)
+                    endpoint = "https://fal.run/minimax/h3-max/reference-to-video" if reference else ENDPOINT
                     s["submitted"], s["busy"] = _signature(s), True
                     s["count"] += 1
                     props.status = f"Generating clip {s['count']} / {props.max_requests}"
-                    _worker = threading.Thread(target=generate, args=(s["key"], payload, s["folder"], s["events"], s["token"], time.perf_counter()-start), daemon=True)
+                    _worker = threading.Thread(target=generate, args=(s["key"], payload, s["folder"], s["events"], s["token"], time.perf_counter()-start, endpoint), daemon=True)
                     _worker.start()
             s["area"].tag_redraw()
         except Exception as exc:
@@ -230,7 +286,10 @@ class FAL_OT_H3Start(bpy.types.Operator):
 
     def execute(self, context):
         global _session
-        from . import live_stream
+        from . import live_stream, live_grid
+        if live_grid._session or any(w.is_alive() for w in live_grid._workers):
+            self.report({"WARNING"}, "Stop the grid and wait for its requests to finish")
+            return {"CANCELLED"}
         if live_stream._stream or any(w.is_alive() for w in live_stream._workers):
             self.report({"WARNING"}, "Stop the camera stream and wait for its requests to finish")
             return {"CANCELLED"}
@@ -279,9 +338,16 @@ class FAL_PT_H3Live(bpy.types.Panel):
         layout.label(text="Viewport → 5-second AI video", icon="CAMERA_DATA")
         layout.operator("fal.h3_layout", icon="WINDOW")
         layout.prop(p, "prompt")
+        layout.prop(p, "preview_mode")
+        layout.prop(p, "source_format")
         layout.prop(p, "resolution")
         layout.prop(p, "settle_seconds")
         layout.prop(p, "max_requests")
+        grid = layout.box()
+        grid.label(text="Four styles / four requests per batch")
+        grid.operator('fal.h3_grid_layout', icon='WINDOW')
+        grid.operator('fal.h3_grid_start', icon='PLAY')
+        grid.operator('fal.h3_grid_stop', icon='PAUSE')
         if _session:
             layout.operator("fal.h3_stop", icon="PAUSE")
         else:
@@ -305,13 +371,6 @@ def _on_load(_):
     _session = _preview = None
 
 
-@persistent
-def _on_geometry(scene, depsgraph):
-    global _geometry_revision
-    if _session and any(u.is_updated_geometry and isinstance(u.id, bpy.types.Object) for u in depsgraph.updates):
-        _geometry_revision += 1
-
-
 _classes = (H3LiveProperties, FAL_OT_H3Layout, FAL_OT_H3Start, FAL_OT_H3Stop, FAL_PT_H3Live)
 
 
@@ -320,7 +379,6 @@ def register():
         bpy.utils.register_class(cls)
     bpy.types.Scene.fal_h3_live = bpy.props.PointerProperty(type=H3LiveProperties)
     bpy.app.handlers.load_pre.append(_on_load)
-    bpy.app.handlers.depsgraph_update_post.append(_on_geometry)
     bpy.app.timers.register(_tick, persistent=True)
 
 
@@ -328,7 +386,7 @@ def unregister():
     _on_load(None)
     if bpy.app.timers.is_registered(_tick):
         bpy.app.timers.unregister(_tick)
-    for handlers, fn in ((bpy.app.handlers.load_pre, _on_load), (bpy.app.handlers.depsgraph_update_post, _on_geometry)):
+    for handlers, fn in ((bpy.app.handlers.load_pre, _on_load),):
         if fn in handlers:
             handlers.remove(fn)
     del bpy.types.Scene.fal_h3_live

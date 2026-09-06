@@ -10,6 +10,7 @@ import bpy
 from . import branding as _branding
 from . import live_preview as _live_preview
 from . import live_stream as _live_stream
+from . import live_grid as _live_grid
 from .app import (
     FAL_PT_3D_JobsPanel,
     FAL_PT_3D_MainPanel,
@@ -48,12 +49,14 @@ def register() -> None:
     bpy.utils.register_class(FAL_PT_VSE_JobsPanel)
     _live_preview.register()
     _live_stream.register()
+    _live_grid.register()
 
 
 def unregister() -> None:
     """
     Unregister the fal.ai addon.
     """
+    _live_grid.unregister()
     _live_stream.unregister()
     _live_preview.unregister()
     _advanced_params.unregister()

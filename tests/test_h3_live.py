@@ -4,9 +4,12 @@ import json
 import queue
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
+from types import SimpleNamespace
 
 import bpy
 
@@ -17,10 +20,100 @@ sys.modules["fal_ai"] = addon
 spec.loader.exec_module(addon)
 from fal_ai import live_preview as live
 from fal_ai import live_stream as stream
+from fal_ai import live_grid as grid
 from fal_ai.stream_buffer import ClipBuffer
 
 
 class LiveTests(unittest.TestCase):
+    def test_grid_launches_four_concurrent_requests_from_one_capture(self):
+        addon.register()
+        scene = bpy.context.scene
+        barrier = threading.Barrier(5)
+        requests = []
+        grid._session = dict(scene=scene, window=SimpleNamespace(scene=scene),
+            area=SimpleNamespace(type='VIEW_3D'), areas=[SimpleNamespace(type='CLIP_EDITOR') for _ in range(4)],
+            observed='same', submitted=None, changed=0, events=queue.Queue(), busy=False,
+            count=0, key='test', folder=tempfile.gettempdir())
+        def generation(key, payload, folder, events, token, capture_seconds, endpoint):
+            requests.append((payload, endpoint))
+            barrier.wait(timeout=3)
+        try:
+            with patch.object(live, '_signature', return_value='same'), patch.object(live, '_capture', return_value=b'\xff\xd8jpeg') as capture, patch.object(live, 'generate', side_effect=generation):
+                grid._tick()
+                barrier.wait(timeout=3)
+                for worker in grid._workers:worker.join(timeout=3)
+            self.assertEqual(capture.call_count, 1)
+            self.assertEqual(len(requests), 4)
+            self.assertEqual(len({r[0]['prompt'] for r in requests}), 4)
+            self.assertEqual(len({r[0]['reference_image_urls'][0] for r in requests}), 1)
+            self.assertTrue(all(r[1] == grid.ENDPOINT for r in requests))
+        finally:
+            addon.unregister()
+
+    def test_grid_maps_out_of_order_results_to_their_style_panes(self):
+        addon.register()
+        scene = bpy.context.scene
+        events = queue.Queue()
+        for index in [3, 1, 2, 0]:
+            events.put((('batch', index), 'complete', {'video_path': f'{index}.mp4'}))
+        grid._session = dict(scene=scene, window=SimpleNamespace(scene=scene),
+            area=SimpleNamespace(type='VIEW_3D'), areas=[SimpleNamespace(type='CLIP_EDITOR') for _ in range(4)],
+            observed='same', submitted='same', changed=0, events=events, busy=True,
+            count=1, pending=set(range(4)), batch_token='batch', results={}, errors={},
+            completed=0, history=[], batch_started=time.perf_counter())
+        try:
+            with patch.object(live, '_signature', return_value='same'), patch.object(grid, '_play') as play:
+                grid._tick()
+            self.assertEqual([(c.args[0],c.args[1]) for c in play.call_args_list], [(i,f'{i}.mp4') for i in [3,1,2,0]])
+            self.assertEqual(scene.fal_h3_live.last_video, '0.mp4')
+            self.assertEqual(grid._session['completed'], 1)
+            self.assertFalse(grid._session['busy'])
+        finally:
+            addon.unregister()
+
+    def test_edit_during_generation_does_not_display_obsolete_clip(self):
+        addon.register()
+        scene = bpy.context.scene
+        events = queue.Queue()
+        events.put(('session', 'complete', {'video_path': 'obsolete.mp4'}))
+        live._session = dict(scene=scene, window=SimpleNamespace(scene=scene),
+            area=SimpleNamespace(type='VIEW_3D', tag_redraw=lambda: None),
+            token='session', events=events, busy=True, count=1, auto=True,
+            submitted='old geometry', observed='old geometry', changed=0)
+        try:
+            with patch.object(live, '_signature', return_value='new geometry'), patch.object(live, '_play') as play:
+                live._tick()
+                play.assert_not_called()
+            self.assertEqual(scene.fal_h3_live.last_video, '')
+            self.assertFalse(live._session['busy'])
+        finally:
+            addon.unregister()
+
+    def test_geometry_digest_ignores_invalidation_but_detects_vertex_edits(self):
+        scene = bpy.context.scene
+        obj = next(o for o in scene.objects if o.type == 'MESH')
+        before = live._geometry_digest(scene)
+        obj.update_tag(refresh={'DATA'})
+        bpy.context.view_layer.update()
+        self.assertEqual(before, live._geometry_digest(scene))
+        original = obj.data.vertices[0].co.copy()
+        try:
+            obj.data.vertices[0].co.x += .25
+            obj.data.update()
+            bpy.context.view_layer.update()
+            self.assertNotEqual(before, live._geometry_digest(scene))
+        finally:
+            obj.data.vertices[0].co = original
+            obj.data.update()
+
+    def test_gray_jpeg_reference_payload(self):
+        payload = live.build_payload(b"\xff\xd8jpeg", "interpret geometry", "480P", reference_mode=True)
+        self.assertTrue(payload["reference_image_urls"][0].startswith("data:image/jpeg;base64,"))
+        self.assertEqual(payload["aspect_ratio"], "16:9")
+        self.assertNotIn("image_url", payload)
+        with self.assertRaises(ValueError):
+            live.build_payload(b"first", "geometry", "480P", b"last", reference_mode=True)
+
     def test_paired_base64(self):
         payload = live.build_payload(b"first", "motion", "480P", b"last")
         self.assertEqual(payload["image_url"], "data:image/png;base64,Zmlyc3Q=")
