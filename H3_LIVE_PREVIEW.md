@@ -101,12 +101,14 @@ seconds of edit-to-visible latency. It is not a geometry-exact raster renderer.
 Add `--grid` to the gray-build command to arrange the gray source beside a 2×2
 grid. The four treatments are expedition realism, North Sea storm, cinematic
 science fiction, and a physical miniature. Style prompts specify surface palette,
-roughness, lighting, and water. They deliberately avoid cues such as finished ships,
-extra fittings, panel lines, or unmodeled windows. Shared geometry rules cap detail
-at the reference's current completeness. Simple geometry stays simple; each modeled
-addition supplies the next level of detail.
+roughness, lighting, and water. Four fixed object-free Krea references anchor the
+styles; see [STYLE_REFERENCES.md](STYLE_REFERENCES.md). Shared geometry rules preserve
+existing components and assembly stage, while interpreting coarse proxies as
+manufactured surfaces. A bare hull stays bare but may gain smooth hull plating;
+modeled window frames become glazing. Facets should not become decorative seams.
 
-Each settled edit captures one JPEG and starts four independent requests together.
+Each settled edit captures one JPEG and starts four independent requests together,
+each with the same geometry image plus its own fixed style image.
 Each pane plays as its response arrives; the scripted build advances after all
 four are visible. Results map by style index, not completion order. Editing during
 a batch invalidates its remaining results. A failed request stops new batches;

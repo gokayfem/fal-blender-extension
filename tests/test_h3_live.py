@@ -25,6 +25,26 @@ from fal_ai.stream_buffer import ClipBuffer
 
 
 class LiveTests(unittest.TestCase):
+    def test_style_reference_is_second_and_geometry_stays_first(self):
+        payload = live.build_payload(b'geometry', 'render', '480P', reference_mode=True, style_image_bytes=b'\xff\xd8style')
+        self.assertEqual(payload['reference_image_urls'][0], live._image_uri(b'geometry'))
+        self.assertEqual(payload['reference_image_urls'][1], live._image_uri(b'\xff\xd8style'))
+        with self.assertRaises(ValueError):
+            live.build_payload(b'geometry', 'render', '480P', style_image_bytes=b'style')
+
+    def test_frozen_style_manifest_rejects_changed_images(self):
+        import hashlib
+        with tempfile.TemporaryDirectory() as directory:
+            folder = Path(directory)
+            image = b'\xff\xd8fixed-style'
+            (folder/'style.jpg').write_bytes(image)
+            manifest = dict(styles=[dict(id=i,file='style.jpg',sha256=hashlib.sha256(image).hexdigest()) for i in ['expedition','storm','orbital','miniature']])
+            path = folder/'manifest.json'
+            path.write_text(json.dumps(manifest),encoding='utf-8')
+            self.assertEqual(grid.load_style_references(str(path)), [image]*4)
+            (folder/'style.jpg').write_bytes(b'\xff\xd8changed')
+            with self.assertRaises(ValueError):grid.load_style_references(str(path))
+
     def test_grid_launches_four_concurrent_requests_from_one_capture(self):
         addon.register()
         scene = bpy.context.scene

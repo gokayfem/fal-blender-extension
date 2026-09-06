@@ -1,5 +1,8 @@
 """Four concurrent H3 reference renders from one captured geometry revision."""
 import queue
+import hashlib
+import json
+from pathlib import Path
 import threading
 import time
 import uuid
@@ -17,19 +20,51 @@ STYLES = (
     ('ORBITAL / SCI-FI', 'Futuristic material palette only: smooth pearl-white ceramic and dark titanium on the existing surfaces, restrained cyan reflected light. Violet dusk and indigo water with very subtle luminous ripples. Physically based polished reflections. Keep broad surfaces clean and plain.'),
     ('WORKSHOP / MINIATURE', 'Physical tabletop miniature photography. Smooth hand-painted navy and cream surfaces. Warm softbox light, subtle tactile matte-paint texture, gentle macro depth of field with the whole object readable. Sculpted teal resin-like water with fine white foam. Keep broad surfaces clean and plain.'),
 )
-GEOMETRY_RULES = ('Image 1 is a strict geometry specification, not an inspiration image. '
-    'Render precisely its current level of completeness. Simple source geometry must produce a simple output. '
-    'Preserve every empty area and every plain face. Only details visibly modeled in Image 1 may exist in the output. '
-    'Style changes materials, light and water only; it never adds physical components, subdivisions or decorative features. '
-    'Match camera, framing, proportions and silhouette. Locked camera. The object stays stationary; only water moves gently. ')
+GEOMETRY_RULES = ('Image 1 is a coarse design proxy for a real manufactured object, not the final surface. '
+    'Preserve the existing major components, their count, placement, proportions and overall design envelope. '
+    'Interpret each component according to its physical function: reconstruct smooth continuous manufactured surfaces '
+    'from the coarse proxy, with believable curvature, rounded fabrication transitions, realistic thickness and material response. '
+    'Visible polygon boundaries, flat-shading facets and blockout bevel bands are modeling artifacts; they must not appear '
+    'as panel lines, hard creases or exposed mesh edges in the finished object. '
+    'Surface refinement is allowed; inventing additional major components is not. '
+    'Keep the current level of assembly: an unfinished assembly stays unfinished, but every existing part looks real. '
+    'Add only restrained surface-scale physical detail appropriate to the components already present. '
+    'Preserve empty spaces and uncluttered broad areas. Match camera, framing and overall silhouette. '
+    'Locked camera. The object stays stationary; only water moves gently. ')
 
 _session = None
 _workers = []
 _playing = {}
 
 
-def prompts_for(base):
-    return [GEOMETRY_RULES + '\nSURFACE AND ENVIRONMENT: ' + treatment + '\nCURRENT GEOMETRY - highest priority: ' + base for _, treatment in STYLES]
+def prompts_for(base, has_style_references=False):
+    binding = (' Image 2 is a fixed object-free style reference. Use Image 2 only for its palette, '
+        'lighting character, material response, texture scale and photographic aesthetic. '
+        'Keep that same visual treatment consistent between generations. All object identity, '
+        'components, framing and layout come exclusively from Image 1, never Image 2. ') if has_style_references else ''
+    return [GEOMETRY_RULES + binding + '\nSURFACE AND ENVIRONMENT: ' + treatment + '\nCURRENT GEOMETRY - highest priority: ' + base for _, treatment in STYLES]
+
+
+def load_style_references(manifest_path):
+    if not manifest_path:
+        return []
+    path = Path(bpy.path.abspath(manifest_path)).resolve()
+    manifest = json.loads(path.read_text(encoding='utf-8'))
+    entries = manifest.get('styles', [])
+    if [e.get('id') for e in entries] != ['expedition', 'storm', 'orbital', 'miniature']:
+        raise ValueError('Style manifest must contain the four expected styles in order')
+    images = []
+    for entry in entries:
+        image_path = (path.parent/entry['file']).resolve()
+        if not image_path.is_relative_to(path.parent):
+            raise ValueError('Style image must be inside its manifest directory')
+        image = image_path.read_bytes()
+        if not image.startswith((b'\xff\xd8', b'\x89PNG\r\n\x1a\n')):
+            raise ValueError('Style reference must be a JPEG or PNG image')
+        if hashlib.sha256(image).hexdigest() != entry['sha256']:
+            raise ValueError('Style reference changed; create a new manifest before using it')
+        images.append(image)
+    return images
 
 
 def create_layout(window, ready):
@@ -74,10 +109,13 @@ def start(window, source, areas):
     key = get_api_key()
     if not key or not bpy.app.online_access:
         raise RuntimeError('Configure a fal key and enable online access')
+    manifest_path = window.scene.fal_h3_live.style_manifest
+    style_images = load_style_references(manifest_path)
     _session = dict(window=window, area=source, scene=window.scene, areas=areas,
         key=key, folder=get_output_dir(), token=uuid.uuid4().hex, events=queue.Queue(),
         busy=False, pending=set(), results={}, errors={}, observed=None, submitted=None,
-        changed=time.perf_counter(), count=0, completed=0, history=[])
+        changed=time.perf_counter(), count=0, completed=0, history=[],
+        style_images=style_images, style_manifest=manifest_path)
     window.scene.fal_h3_live.status = 'Grid ready — waiting for geometry'
     return _session
 
@@ -113,6 +151,8 @@ def _tick():
         return 1/24
     try:
         p = s['scene'].fal_h3_live
+        if 'style_manifest' in s and p.style_manifest != s['style_manifest']:
+            raise RuntimeError('Style manifest changed; restart the grid to load the new reference set')
         if s['window'].scene != s['scene'] or s['area'].type != 'VIEW_3D' or any(a.type != 'CLIP_EDITOR' for a in s['areas']):
             raise RuntimeError('Grid layout changed; restart the session')
         signature = live._signature(s)
@@ -159,8 +199,10 @@ def _tick():
             s.update(submitted=live._signature(s), busy=True, pending=set(range(4)),
                 results={}, errors={}, batch_token=uuid.uuid4().hex, count=s['count']+1)
             _workers = []
-            for index, prompt in enumerate(prompts_for(p.prompt)):
-                payload = live.build_payload(image, prompt, p.resolution, reference_mode=True)
+            styles = s.get('style_images', [])
+            for index, prompt in enumerate(prompts_for(p.prompt, bool(styles))):
+                payload = live.build_payload(image, prompt, p.resolution, reference_mode=True,
+                    style_image_bytes=styles[index] if styles else None)
                 worker = threading.Thread(target=live.generate, args=(s['key'], payload, s['folder'],
                     s['events'], (s['batch_token'], index), capture_seconds, ENDPOINT), daemon=True)
                 _workers.append(worker)

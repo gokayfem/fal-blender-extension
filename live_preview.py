@@ -28,7 +28,7 @@ def _image_uri(image_bytes):
     return "data:" + mime + ";base64," + base64.b64encode(image_bytes).decode()
 
 
-def build_payload(image_bytes, prompt, resolution, end_image_bytes=None, reference_mode=False):
+def build_payload(image_bytes, prompt, resolution, end_image_bytes=None, reference_mode=False, style_image_bytes=None):
     if not prompt.strip():
         raise ValueError("Enter a motion prompt")
     if resolution not in {"480P", "768P"}:
@@ -37,8 +37,12 @@ def build_payload(image_bytes, prompt, resolution, end_image_bytes=None, referen
                 prompt_expansion_mode="balanced", enable_safety_checker=True, sync_mode=False)
     if reference_mode:
         payload["reference_image_urls"] = [_image_uri(image_bytes)]
+        if style_image_bytes is not None:
+            payload["reference_image_urls"].append(_image_uri(style_image_bytes))
         payload["aspect_ratio"] = "16:9"
     else:
+        if style_image_bytes is not None:
+            raise ValueError("Style references require reference mode")
         payload["image_url"] = _image_uri(image_bytes)
     if end_image_bytes is not None:
         if reference_mode:
@@ -82,6 +86,7 @@ def generate(key, payload, folder, events, token, capture_seconds, endpoint=ENDP
 
 
 class H3LiveProperties(bpy.types.PropertyGroup):
+    style_manifest: bpy.props.StringProperty(name="Fixed style references", subtype='FILE_PATH', default=str(Path(__file__).parent/'assets'/'h3-style-references'/'manifest.json'))
     preview_mode: bpy.props.EnumProperty(name="Preview model", items=[("I2V", "Turbo / anchored first frame", ""), ("REFERENCE", "H3 Max / interpret gray geometry", "")], default="I2V")
     source_format: bpy.props.EnumProperty(name="Capture", items=[("PNG", "PNG / 848px", ""), ("JPEG", "Small JPEG / 512px", "")], default="PNG")
     prompt: bpy.props.StringProperty(name="Motion prompt", default="Slow cinematic camera move around the object. Preserve its shape, colors and composition. Subtle atmospheric motion.")
@@ -345,6 +350,7 @@ class FAL_PT_H3Live(bpy.types.Panel):
         layout.prop(p, "max_requests")
         grid = layout.box()
         grid.label(text="Four styles / four requests per batch")
+        grid.prop(p, 'style_manifest')
         grid.operator('fal.h3_grid_layout', icon='WINDOW')
         grid.operator('fal.h3_grid_start', icon='PLAY')
         grid.operator('fal.h3_grid_stop', icon='PAUSE')
