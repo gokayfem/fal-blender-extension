@@ -2,9 +2,13 @@ name: Tests
 
 on:
   push:
-    branches: [main]
+    branches: [main, 'feat/**']
   pull_request:
     branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
   unit-tests:
@@ -26,24 +30,25 @@ jobs:
           cp tests/test_models.py /tmp/test_models.py
           python -m pytest /tmp/test_models.py -v
 
-  # Integration tests with Blender
-  # Uncomment when ready to add Blender to CI
-  # integration-tests:
-  #   runs-on: ubuntu-latest
-  #   strategy:
-  #     matrix:
-  #       blender-version: ['4.2', '5.0']
-  #   steps:
-  #     - uses: actions/checkout@v4
-  #     
-  #     - name: Set up Blender
-  #       run: |
-  #         sudo snap install blender --channel=${{ matrix.blender-version }}/stable --classic
-  #     
-  #     - name: Install extension
-  #       run: |
-  #         mkdir -p ~/.config/blender/${{ matrix.blender-version }}/extensions/user_default
-  #         cp -r . ~/.config/blender/${{ matrix.blender-version }}/extensions/user_default/fal_ai
-  #     
-  #     - name: Run integration tests
-  #       run: blender --background --python tests/test_blender_integration.py
+      - name: Check repository sources and docs
+        run: python scripts/check_repository.py
+
+  h3-blender-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Install extension dependencies
+        run: python -m pip install --target vendor -r requirements.txt
+      - name: Install Blender 5.1.2
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y libxi6 libxrender1 libxxf86vm1 libxfixes3 libxkbcommon0 libsm6 libgl1
+          curl --fail --location --retry 2 https://download.blender.org/release/Blender5.1/blender-5.1.2-linux-x64.tar.xz -o /tmp/blender.tar.xz
+          mkdir /tmp/blender-h3
+          tar -xf /tmp/blender.tar.xz -C /tmp/blender-h3 --strip-components=1
+      - name: Run H3 tests without API calls
+        run: /tmp/blender-h3/blender --background --factory-startup --python-exit-code 1 --python tests/test_h3_live.py

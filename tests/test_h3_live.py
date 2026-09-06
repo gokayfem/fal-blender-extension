@@ -25,6 +25,28 @@ from fal_ai.stream_buffer import ClipBuffer
 
 
 class LiveTests(unittest.TestCase):
+    def test_early_stage_prompts_do_not_prime_future_components(self):
+        from fal_ai import stage_prompts
+        for stage in (0, 1, 2):
+            for prompt in grid.prompts_for(stage_prompts.for_stage(stage), False, 'PER_STYLE_TEXT'):
+                for absent in ('mast', 'crane', 'window', 'roof', 'tender'):
+                    self.assertNotIn(absent, prompt.lower())
+
+    def test_per_style_payload_keeps_geometry_and_style_roles_separate(self):
+        from fal_ai import image_guidance
+        bundle = dict(mode='PER_STYLE', common=['full', 'detail'],
+                      buffers=['normals', 'mask'], styles=['day', 'storm', 'space', 'mini'])
+        expected = [['full']*3+['day'], ['full','normals','mask','storm'],
+                    ['full','space'], ['full','detail','mini']]
+        for index, images in enumerate(expected):
+            payload = image_guidance.payload(bundle, 'prompt', '480P', 112358, index)
+            self.assertEqual(payload['reference_image_urls'], images)
+            self.assertNotIn('reference_video_urls', payload)
+        bundle['mode'] = 'PER_STYLE_TEXT'
+        for index in range(4):
+            payload = image_guidance.payload(bundle, 'prompt', '768P', 112358, index)
+            self.assertEqual(payload['reference_image_urls'], expected[index][:-1])
+
     def test_style_reference_is_second_and_geometry_stays_first(self):
         payload = live.build_payload(b'geometry', 'render', '480P', reference_mode=True, style_image_bytes=b'\xff\xd8style')
         self.assertEqual(payload['reference_image_urls'][0], live._image_uri(b'geometry'))
@@ -208,7 +230,8 @@ class LiveTests(unittest.TestCase):
             def __exit__(self, *args): pass
             def read(self): return self.data
         events = queue.Queue()
-        result = {"video": {"url": "https://example.com/test.mp4"}, "timings": {"inference": 0.49}}
+        result = {"video": {"url": "https://example.com/test.mp4"}, "timings": {"inference": 0.49},
+                  "expanded_prompt": "Static camera after expansion", "seed": 73419}
         with tempfile.TemporaryDirectory() as folder:
             with patch.object(live.urllib.request, "urlopen", side_effect=[Response(json.dumps(result).encode()), Response(b"movie")]):
                 live.generate("SECRET", live.build_payload(b"png", "motion", "480P"), folder, events, "token", 0.1)
@@ -217,6 +240,8 @@ class LiveTests(unittest.TestCase):
             self.assertEqual(kind, "complete")
             self.assertEqual(Path(data["video_path"]).read_bytes(), b"movie")
             self.assertEqual(data["provider_timings"]["inference"], 0.49)
+            self.assertEqual(data["expanded_prompt"], result["expanded_prompt"])
+            self.assertEqual(data["seed"], 73419)
             self.assertNotIn("SECRET", Path(data["video_path"]).with_suffix(".json").read_text())
 
 

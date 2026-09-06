@@ -1,0 +1,29 @@
+name: Bug report
+description: Report an extension or demo problem
+body:
+  - type: markdown
+    attributes:
+      value: Do not include API keys, private scenes, or unreviewed logs.
+  - type: input
+    id: environment
+    attributes:
+      label: Blender version, OS and extension commit
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps and expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior and sanitized error
+    validations:
+      required: true
+  - type: textarea
+    id: settings
+    attributes:
+      label: Model settings and repeatability
+      description: Endpoint, seed, resolution, guidance mode and sample count

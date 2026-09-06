@@ -71,7 +71,8 @@ def generate(key, payload, folder, events, token, capture_seconds, endpoint=ENDP
         total = time.perf_counter() - started
         metadata = dict(model=endpoint.removeprefix("https://fal.run/"),
                         request_id=request_id, resolution=payload["resolution"], duration=5,
-                        prompt=payload["prompt"], provider_timings=result.get("timings"),
+                        prompt=payload["prompt"], expanded_prompt=result.get("expanded_prompt"),
+                        seed=result.get("seed", payload.get("seed")), provider_timings=result.get("timings"),
                         conditioning="reference" if "reference_image_urls" in payload else ("first_last" if "end_image_url" in payload else "first"),
                         capture_seconds=capture_seconds, api_seconds=api_seconds,
                         download_seconds=total-api_seconds, total_seconds=total+capture_seconds,
@@ -86,10 +87,12 @@ def generate(key, payload, folder, events, token, capture_seconds, endpoint=ENDP
 
 
 class H3LiveProperties(bpy.types.PropertyGroup):
+    grid_guidance: bpy.props.EnumProperty(name="Image guidance", items=[('PER_STYLE_TEXT','Cartoon / clay / real / painted','Same fixed-camera geometry inputs; style described in text to avoid swatch leakage'),('PER_STYLE','Measured per-style / fixed camera','Image-only recipes for the four styles; orbital remains experimental'),('IMAGE','Full frame','Full geometry image and fixed style reference'),('DETAIL','Full frame + 3×3 details','Aspect-preserved detail crops; full frame stays authoritative'),('MATERIAL','Material replacement + details','Stronger surface-only instructions; experimental')], default='IMAGE')
+    grid_seed: bpy.props.IntProperty(name="Fixed seed", default=73419, min=0)
     style_manifest: bpy.props.StringProperty(name="Fixed style references", subtype='FILE_PATH', default=str(Path(__file__).parent/'assets'/'h3-style-references'/'manifest.json'))
     preview_mode: bpy.props.EnumProperty(name="Preview model", items=[("I2V", "Turbo / anchored first frame", ""), ("REFERENCE", "H3 Max / interpret gray geometry", "")], default="I2V")
     source_format: bpy.props.EnumProperty(name="Capture", items=[("PNG", "PNG / 848px", ""), ("JPEG", "Small JPEG / 512px", "")], default="PNG")
-    prompt: bpy.props.StringProperty(name="Motion prompt", default="Slow cinematic camera move around the object. Preserve its shape, colors and composition. Subtle atmospheric motion.")
+    prompt: bpy.props.StringProperty(name="Motion prompt", default="Fixed camera. Preserve the input projection, framing, object position and size. No zoom, pan, tilt, orbit or object motion. Only subtle environmental motion outside the object.")
     resolution: bpy.props.EnumProperty(name="Resolution", items=[("480P", "480p / fast", ""), ("768P", "768p", "")], default="480P")
     max_requests: bpy.props.IntProperty(name="Session clip limit", default=10, min=1, max=100)
     settle_seconds: bpy.props.FloatProperty(name="Wait after changes", default=0.8, min=0.3, max=10, subtype="TIME")
@@ -138,7 +141,7 @@ def _signature(session):
         values += [obj.name, obj.hide_viewport, obj.hide_render]
         values += [round(v, 4) for row in obj.matrix_world for v in row]
     props = scene.fal_h3_live
-    return tuple(values) + (scene.frame_current, props.prompt, props.resolution, props.preview_mode, props.source_format, _geometry_digest(scene))
+    return tuple(values) + (scene.frame_current, props.prompt, props.resolution, props.preview_mode, props.source_format, props.grid_guidance, props.grid_seed, _geometry_digest(scene))
 
 
 def _capture(session, camera_view=False):
@@ -351,6 +354,8 @@ class FAL_PT_H3Live(bpy.types.Panel):
         grid = layout.box()
         grid.label(text="Four styles / four requests per batch")
         grid.prop(p, 'style_manifest')
+        grid.prop(p, 'grid_guidance')
+        grid.prop(p, 'grid_seed')
         grid.operator('fal.h3_grid_layout', icon='WINDOW')
         grid.operator('fal.h3_grid_start', icon='PLAY')
         grid.operator('fal.h3_grid_stop', icon='PAUSE')

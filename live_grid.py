@@ -11,15 +11,12 @@ import bpy
 from bpy.app.handlers import persistent
 
 from . import live_preview as live
+from . import image_guidance
 from .preferences import get_api_key, get_output_dir
 
 ENDPOINT = 'https://fal.run/minimax/h3-max/reference-to-video'
-STYLES = (
-    ('EXPEDITION / REAL', 'Photographic natural daylight. Smooth navy-blue and warm-ivory marine paint on the existing surfaces. Physically realistic roughness, weight, contact shadows and reflections. Deep blue-green water with gentle small ripples. Neutral documentary color. Keep broad surfaces clean and plain.'),
-    ('NORTH SEA / STORM', 'Cinematic cold overcast light. Smooth graphite and pale-gray painted surfaces, visibly wet with restrained reflections. Dark blue water with modest foam, fine rain and cool atmospheric haze. Preserve full visibility of the reference shape. Keep broad surfaces clean and plain.'),
-    ('ORBITAL / SCI-FI', 'Futuristic material palette only: smooth pearl-white ceramic and dark titanium on the existing surfaces, restrained cyan reflected light. Violet dusk and indigo water with very subtle luminous ripples. Physically based polished reflections. Keep broad surfaces clean and plain.'),
-    ('WORKSHOP / MINIATURE', 'Physical tabletop miniature photography. Smooth hand-painted navy and cream surfaces. Warm softbox light, subtle tactile matte-paint texture, gentle macro depth of field with the whole object readable. Sculpted teal resin-like water with fine white foam. Keep broad surfaces clean and plain.'),
-)
+from . import surface_prompts
+STYLES = tuple(zip(('CARTOON', 'CLAYMATION', 'REALISTIC', 'STYLIZED / GOUACHE'), surface_prompts.STYLES))
 GEOMETRY_RULES = ('Image 1 is a coarse design proxy for a real manufactured object, not the final surface. '
     'Preserve the existing major components, their count, placement, proportions and overall design envelope. '
     'Interpret each component according to its physical function: reconstruct smooth continuous manufactured surfaces '
@@ -37,12 +34,53 @@ _workers = []
 _playing = {}
 
 
-def prompts_for(base, has_style_references=False):
-    binding = (' Image 2 is a fixed object-free style reference. Use Image 2 only for its palette, '
+def prompts_for(base, has_style_references=False, mode='IMAGE'):
+    if mode == 'PER_STYLE_TEXT':
+        roles = ['Images 1, 2 and 3 repeat the same target geometry and camera. ', 'Image 1 is the target geometry and camera. Image 2 is camera-space surface normals. Image 3 is the exact visible silhouette mask, black object on white background. ', 'Image 1 is the target geometry and camera. ', 'Image 1 is the target geometry and camera. Image 2 contains enlarged geometry details, never a different framing. ']
+        return [roles[i] + surface_prompts.TEMPORAL + surface_prompts.REALISM + surface_prompts.STYLES[i] + ' STYLE is defined entirely by the chosen-medium description. CURRENT GEOMETRY HAS HIGHEST PRIORITY: ' + base for i in range(4)]
+    if mode == 'PER_STYLE':
+        common = ('One single full-frame view of the input geometry. Image 1 alone determines camera projection, viewpoint, framing, silhouette, object size and exact pixel positions. No zoom, pan, tilt, roll, orbit, dolly or reframing. No object movement, rocking or deformation. Only subtle water motion outside the hull. Transfer only palette, light and surface material character from the designated STYLE image. Never copy composition or object scale from STYLE. ')
+        roles = ['Images 1, 2 and 3 repeat the exact same target camera and geometry. Image 4 is STYLE only. ', 'Image 2 encodes camera-space surface normals; use it only for face orientation and boundaries. Image 3 is the exact visible silhouette mask: black ship, white background. Match it. Image 4 is STYLE only. ', 'Image 2 is STYLE only. ', 'Image 2 is an aspect-preserved 3x3 detail sheet. Its crops explain components only, not camera framing. Image 3 is STYLE only. ']
+        return [role + common + base for role in roles]
+    style_number = 3 if mode in {'DETAIL','MATERIAL'} else 2
+    binding = (f' Image {style_number} is a fixed object-free style reference. Use it only for its palette, '
         'lighting character, material response, texture scale and photographic aesthetic. '
         'Keep that same visual treatment consistent between generations. All object identity, '
-        'components, framing and layout come exclusively from Image 1, never Image 2. ') if has_style_references else ''
-    return [GEOMETRY_RULES + binding + '\nSURFACE AND ENVIRONMENT: ' + treatment + '\nCURRENT GEOMETRY - highest priority: ' + base for _, treatment in STYLES]
+        'components, framing and layout come exclusively from Image 1, never the style reference. ') if has_style_references else ''
+    rules = GEOMETRY_RULES
+    if mode in {'DETAIL','MATERIAL'}:
+        rules = ('Image 1 alone defines the target camera projection, framing, silhouette, object size and pixel positions. '
+            'Image 2 is a 3x3 aspect-preserved detail sheet of that same geometry. Its center is the full frame; '
+            'other tiles explain components only. Never copy the grid, its labels or its crop framing. '
+            'Preserve component count, relative heights, surface borders, roof outline and empty spaces. '
+            'Window-frame rectangles indicate glazing: make their interiors dark reflective glass without moving the borders. '
+            'No zoom, pan, tilt, roll, orbit, dolly, reframing, object motion or deformation. '
+            'The camera is stationary; only subtle environmental motion outside the object is allowed. ')
+    if mode == 'MATERIAL':
+        rules += ('This is material replacement on an existing CG render, not reconstruction of a new object. '
+            'Change surface color, roughness, reflection and illumination only. Remove tessellation shading artifacts '
+            'without remodeling the geometry. ')
+    return [rules + binding + '\nSURFACE AND ENVIRONMENT: ' + treatment + '\nCURRENT GEOMETRY - highest priority: ' + base for _, treatment in STYLES]
+
+
+def _submit_batch(image, styles, mode, seed, prompts, resolution, key, folder, events, token, capture_seconds, buffers=None):
+    """One preparation worker supervises four parallel requests; no Blender access."""
+    started = time.perf_counter()
+    try:
+        bundle = image_guidance.prepare(image, styles, mode, buffers)
+        preparation_seconds = time.perf_counter() - started
+        workers = []
+        for index, prompt in enumerate(prompts):
+            payload = image_guidance.payload(bundle, prompt, resolution, seed, index)
+            worker = threading.Thread(target=live.generate, args=(key, payload, folder, events,
+                (token,index), capture_seconds+preparation_seconds, ENDPOINT), daemon=True)
+            workers.append(worker)
+            worker.start()
+        for worker in workers:
+            worker.join()
+    except Exception as exc:
+        for index in range(4):
+            events.put(((token,index), 'error', f'Image guidance preparation failed: {type(exc).__name__}'))
 
 
 def load_style_references(manifest_path):
@@ -194,20 +232,24 @@ def _tick():
                     break
         if _session is s and not s['busy'] and signature != s['submitted'] and now-s['changed'] >= p.settle_seconds:
             s['batch_started'] = time.perf_counter()
-            image = live._capture(s)
+            buffers = None
+            if p.grid_guidance in {'PER_STYLE','PER_STYLE_TEXT'}:
+                from . import camera_guidance
+                image, normal, mask = camera_guidance.capture(s)
+                buffers = (normal, mask)
+            else:
+                image = live._capture(s)
             capture_seconds = time.perf_counter()-s['batch_started']
             s.update(submitted=live._signature(s), busy=True, pending=set(range(4)),
                 results={}, errors={}, batch_token=uuid.uuid4().hex, count=s['count']+1)
-            _workers = []
             styles = s.get('style_images', [])
-            for index, prompt in enumerate(prompts_for(p.prompt, bool(styles))):
-                payload = live.build_payload(image, prompt, p.resolution, reference_mode=True,
-                    style_image_bytes=styles[index] if styles else None)
-                worker = threading.Thread(target=live.generate, args=(s['key'], payload, s['folder'],
-                    s['events'], (s['batch_token'], index), capture_seconds, ENDPOINT), daemon=True)
-                _workers.append(worker)
-                worker.start()
-            p.status = f"Grid {s['count']} — four concurrent inferences"
+            mode = p.grid_guidance
+            worker = threading.Thread(target=_submit_batch, args=(image, styles, mode, p.grid_seed,
+                prompts_for(p.prompt, bool(styles), mode), p.resolution, s['key'], s['folder'],
+                s['events'], s['batch_token'], capture_seconds, buffers), daemon=True)
+            _workers = [worker]
+            worker.start()
+            p.status = f"Grid {s['count']} — preparing image guidance, then four inferences"
         elif _session is s and s['busy']:
             p.status = f"Grid {s['count']} — {4-len(s['pending'])}/4 views ready"
     except Exception as exc:

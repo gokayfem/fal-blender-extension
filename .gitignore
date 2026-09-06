@@ -8,6 +8,13 @@ build/
 *.zip
 .venv/
 .env
+.env.*
+!.env.example
+outputs/
+*.blend
+*.blend1
+*.log
+.pytest_cache/
 # Generated from blender_manifest.toml.template (make sync-manifest)
 blender_manifest.toml
 # No wheels
