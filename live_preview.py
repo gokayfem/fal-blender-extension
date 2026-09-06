@@ -22,14 +22,17 @@ _geometry_revision = 0
 _worker = None
 
 
-def build_payload(image_bytes, prompt, resolution):
+def build_payload(image_bytes, prompt, resolution, end_image_bytes=None):
     if not prompt.strip():
         raise ValueError("Enter a motion prompt")
     if resolution not in {"480P", "768P"}:
         raise ValueError("Unsupported resolution")
-    return dict(prompt=prompt.strip(), duration=5, resolution=resolution,
+    payload = dict(prompt=prompt.strip(), duration=5, resolution=resolution,
                 image_url="data:image/png;base64," + base64.b64encode(image_bytes).decode(),
                 prompt_expansion_mode="balanced", enable_safety_checker=True, sync_mode=False)
+    if end_image_bytes is not None:
+        payload["end_image_url"] = "data:image/png;base64," + base64.b64encode(end_image_bytes).decode()
+    return payload
 
 
 def generate(key, payload, folder, events, token, capture_seconds):
@@ -53,6 +56,7 @@ def generate(key, payload, folder, events, token, capture_seconds):
         metadata = dict(model=ENDPOINT.removeprefix("https://fal.run/"),
                         request_id=request_id, resolution=payload["resolution"], duration=5,
                         prompt=payload["prompt"], provider_timings=result.get("timings"),
+                        conditioning="first_last" if "end_image_url" in payload else "first",
                         capture_seconds=capture_seconds, api_seconds=api_seconds,
                         download_seconds=total-api_seconds, total_seconds=total+capture_seconds,
                         video_path=str(path))
@@ -71,6 +75,7 @@ class H3LiveProperties(bpy.types.PropertyGroup):
     max_requests: bpy.props.IntProperty(name="Session clip limit", default=10, min=1, max=100)
     settle_seconds: bpy.props.FloatProperty(name="Wait after changes", default=0.8, min=0.3, max=10, subtype="TIME")
     status: bpy.props.StringProperty(default="Ready — capture the viewport to animate it", options={"SKIP_SAVE"})
+    stream_status: bpy.props.StringProperty(default="Ready for camera animation", options={"SKIP_SAVE"})
     timing: bpy.props.StringProperty(default="", options={"SKIP_SAVE"})
     last_video: bpy.props.StringProperty(subtype="FILE_PATH", options={"SKIP_SAVE"})
 
@@ -88,7 +93,7 @@ def _signature(session):
     return tuple(values) + (scene.frame_current, props.prompt, props.resolution, _geometry_revision)
 
 
-def _capture(session):
+def _capture(session, camera_view=False):
     scene, area, window = session["scene"], session["area"], session["window"]
     render = scene.render
     names = ("resolution_x", "resolution_y", "resolution_percentage", "filepath", "film_transparent", "use_sequencer", "use_compositing")
@@ -106,7 +111,7 @@ def _capture(session):
         render.image_settings.file_format = "PNG"
         area.spaces.active.overlay.show_overlays = False
         with bpy.context.temp_override(window=window, area=area, region=region):
-            bpy.ops.render.opengl(write_still=True, view_context=True)
+            bpy.ops.render.opengl(write_still=True, view_context=not camera_view)
         return path.read_bytes()
     finally:
         for name, value in saved.items():
@@ -225,6 +230,10 @@ class FAL_OT_H3Start(bpy.types.Operator):
 
     def execute(self, context):
         global _session
+        from . import live_stream
+        if live_stream._stream or any(w.is_alive() for w in live_stream._workers):
+            self.report({"WARNING"}, "Stop the camera stream and wait for its requests to finish")
+            return {"CANCELLED"}
         if _session:
             return {"CANCELLED"}
         if _worker and _worker.is_alive():

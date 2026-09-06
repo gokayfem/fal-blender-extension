@@ -9,6 +9,10 @@ H3 Max Turbo clip at 480p or 768p, and loop it beside the scene. Optional automa
 refresh waits for scene/view changes to settle and stops at a configurable clip
 limit. See [setup, timing, and limitations](H3_LIVE_PREVIEW.md).
 
+The **First + Last Frame Stream** mode follows a camera animation using two base64
+keyframes per segment, two parallel requests, and an ordered playback buffer.
+The included ship demo builds a complete scene for testing continuous delivery.
+
 ## Quick Start
 
 1. Install the addon (see [Installation](#installation)) - supports Blender 4.2 and up on all platforms

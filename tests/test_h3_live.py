@@ -16,9 +16,51 @@ addon = importlib.util.module_from_spec(spec)
 sys.modules["fal_ai"] = addon
 spec.loader.exec_module(addon)
 from fal_ai import live_preview as live
+from fal_ai import live_stream as stream
+from fal_ai.stream_buffer import ClipBuffer
 
 
 class LiveTests(unittest.TestCase):
+    def test_paired_base64(self):
+        payload = live.build_payload(b"first", "motion", "480P", b"last")
+        self.assertEqual(payload["image_url"], "data:image/png;base64,Zmlyc3Q=")
+        self.assertEqual(payload["end_image_url"], "data:image/png;base64,bGFzdA==")
+
+    def test_buffer_preserves_order_and_waits_for_prefill(self):
+        buffer = ClipBuffer(2)
+        buffer.put(1, "second")
+        self.assertIsNone(buffer.pop())
+        buffer.put(0, "first")
+        self.assertEqual(buffer.pop(), "first")
+        self.assertEqual(buffer.pop(), "second")
+        self.assertIsNone(buffer.pop())
+        buffer.put(3, "fourth")
+        self.assertIsNone(buffer.pop())
+        buffer.put(2, "third")
+        self.assertEqual(buffer.pop(), "third")
+        self.assertEqual(buffer.pop(), "fourth")
+
+    def test_short_stream_can_drain_and_rejects_duplicates(self):
+        buffer = ClipBuffer(2)
+        buffer.put(0, "one")
+        self.assertIsNone(buffer.pop())
+        self.assertEqual(buffer.pop(final=True), "one")
+        with self.assertRaises(ValueError): buffer.put(0, "duplicate")
+
+    def test_pair_reuses_boundary_and_restores_timeline(self):
+        scene = bpy.context.scene
+        scene.frame_set(42)
+        session = {"scene": scene}
+        with patch.object(live, "_capture", side_effect=[b"first", b"boundary", b"last"]) as capture:
+            first, last, _ = stream.capture_pair(session, 1, 121)
+            second_first, second_last, _ = stream.capture_pair(session, 121, 241)
+        self.assertEqual(capture.call_count, 3)
+        self.assertEqual(last, second_first)
+        self.assertEqual(scene.frame_current, 42)
+        with patch.object(live, "_capture", side_effect=RuntimeError("capture failed")):
+            with self.assertRaises(RuntimeError): stream.capture_pair(session, 241, 361)
+        self.assertEqual(scene.frame_current, 42)
+
     def test_registration_and_defaults(self):
         addon.register()
         self.assertEqual(bpy.context.scene.fal_h3_live.resolution, "480P")
